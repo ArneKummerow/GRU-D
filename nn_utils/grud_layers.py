@@ -1,15 +1,20 @@
 from __future__ import absolute_import, division, print_function
 
+import tensorflow
 from keras import backend as K
 from keras import constraints, initializers, regularizers
-from keras.engine import InputSpec, Layer
-from keras.layers.recurrent import _generate_dropout_mask
-from keras.layers.recurrent import GRU, GRUCell, RNN
-from keras.layers.wrappers import Bidirectional
-from keras.utils.generic_utils import has_arg, serialize_keras_object
+from keras.layers import InputSpec, Layer
+import keras.layers.rnn.dropout_rnn_cell_mixin
+from keras.layers.rnn import rnn_utils
+from keras.layers.rnn import GRU, GRUCell, RNN
+from keras.layers import Bidirectional
+from keras.utils.generic_utils import has_arg
+from keras.saving.serialization_lib import serialize_keras_object
 
 from .activations import get_activation
 
+# def _generate_dropout_mask(ones, rate, training=None, count=1):
+#     return keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(K, ones=ones, rate=rate, training=training, count=count)
 
 __all__ = ['Bidirectional_for_GRUD', 'GRUDCell', 'GRUD']
 
@@ -29,6 +34,9 @@ class GRUDCell(GRUCell):
                  decay_constraint=None,
                  **kwargs):
         super(GRUDCell, self).__init__(units, **kwargs)
+        # self._masking_dropout_mask_cache = K.ContextValueCache(
+        #     self._create_masking_dropout_mask
+        # )
 
         assert 'reset_after' not in kwargs or not kwargs['reset_after'], (
             'Only the default GRU reset gate can be used in GRU-D.'
@@ -55,6 +63,7 @@ class GRUDCell(GRUCell):
         self.feed_masking = feed_masking
         if self.feed_masking:
             self.masking_decay = get_activation(masking_decay)
+            # self._masking_dropout_mask = None
             self._masking_dropout_mask = None
         else:
             self.masking_decay = None
@@ -66,6 +75,34 @@ class GRUDCell(GRUCell):
             self.decay_regularizer = regularizers.get(decay_regularizer)
             self.decay_constraint = constraints.get(decay_constraint)
         
+    # def reset_masking_dropout_mask(self):
+    #     self._masking_dropout_mask_cache.clear()
+    
+    # def _create_masking_dropout_mask(self, inputs, training, count=1):
+    #     return keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
+    #         self._random_generator,
+    #         tf.ones_like(inputs),
+    #         self.dropout,
+    #         training=training,
+    #         count=count,
+    #     )
+
+    # def get_masking_dropout_mask_for_cell(self, inputs, training, count=1):
+    #     if self.dropout == 0:
+    #         return None
+    #     init_kwargs = dict(inputs=inputs, training=training, count=count)
+    #     return self._masking_dropout_mask_cache.setdefault(kwargs=init_kwargs)
+
+    # def __getstate__(self):
+    #     state = super().__getstate__()
+    #     state.pop("_masking_dropout_mask_cache", None)
+    #     return state
+
+    # def __setstate__(self, state):
+    #     state["_masking_dropout_mask_cache"] = backend.ContextValueCache(
+    #         self._create_dropout_mask
+    #     )
+    #     super().__setstate__(state)
 
     def build(self, input_shape):
         """
@@ -148,14 +185,11 @@ class GRUDCell(GRUCell):
                         regularizer=self.bias_regularizer,
                         constraint=self.bias_constraint
                     )
-            self.masking_kernel_z = self.masking_kernel[:, :self.units]
-            self.masking_kernel_r = self.masking_kernel[:, self.units:self.units * 2]
-            self.masking_kernel_h = self.masking_kernel[:, self.units * 2:]
 
         self.true_input_dim = input_dim
         self.built = True
 
-    def call(self, inputs, states, training=None):
+    def call(self, inputs, states=None, training=None):
         """We need to reimplmenet `call` entirely rather than reusing that
         from `GRUCell` since there are lots of differences.
 
@@ -167,9 +201,15 @@ class GRUDCell(GRUCell):
                 (h_tm1, x_keep_tm1, s_prev_tm1)
         """
         # Get inputs and states
-        input_x = inputs[:, :self.true_input_dim]   # inputs x, m, s
-        input_m = inputs[:, self.true_input_dim:-1]
-        input_s = inputs[:, -1:]
+        # input_x = inputs[:, :self.true_input_dim]   # inputs x, m, s
+        # input_m = inputs[:, self.true_input_dim:-1]
+        # input_s = inputs[:, -1:]
+        input_x = inputs[0]
+        input_m = inputs[1]
+        input_s = inputs[2]
+        if states is None:
+            # states = self.get_initial_state([input_x, input_m, input_s])
+            states = self.get_initial_state(inputs)
         # Need to add broadcast for time_stamp if using theano backend.
         if K.backend() == 'theano':
             input_s = K.pattern_broadcast(input_s, [False, True])
@@ -183,29 +223,46 @@ class GRUDCell(GRUCell):
 
         # Get dropout
         if 0. < self.dropout < 1. and self._dropout_mask is None:
-            self._dropout_mask = _generate_dropout_mask(
+            self._dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
+                self._random_generator,
                 K.ones_like(input_x),
                 self.dropout,
                 training=training,
                 count=3)
+            dp_mask = self._dropout_mask
         if (0. < self.recurrent_dropout < 1. and
                 self._recurrent_dropout_mask is None):
-            self._recurrent_dropout_mask = _generate_dropout_mask(
+            self._recurrent_dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
+                self._random_generator,
                 K.ones_like(h_tm1),
                 self.recurrent_dropout,
                 training=training,
                 count=3)
-        dp_mask = self._dropout_mask
-        rec_dp_mask = self._recurrent_dropout_mask
+            rec_dp_mask = self._recurrent_dropout_mask
 
         if self.feed_masking:
             if 0. < self.dropout < 1. and self._masking_dropout_mask is None:
-                self._masking_dropout_mask = _generate_dropout_mask(
+                self._masking_dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
+                    self._random_generator,
                     K.ones_like(input_m),
                     self.dropout,
                     training=training,
                     count=3)
             m_dp_mask = self._masking_dropout_mask
+        
+        if self.use_bias:
+            if not self.reset_after:
+                input_bias, recurrent_bias = self.bias, None
+            else:
+                input_bias, recurrent_bias = tensorflow.unstack(self.bias)
+        
+        # dp_mask = self.get_dropout_mask_for_cell(input_x, training, count=3)
+        # rec_dp_mask = self.get_recurrent_dropout_mask_for_cell(
+        #     h_tm1, training, count=3
+        # )
+        # m_dp_mask = self.get_masking_dropout_mask_for_cell(
+        #     input_m, training, count=3
+        # )
 
         # Compute decay if any
         if self.input_decay is not None:
@@ -275,17 +332,17 @@ class GRUDCell(GRUCell):
             h_tm1_z, h_tm1_r = h_tm1d, h_tm1d
 
         # Get z_t, r_t, hh_t
-        z_t = K.dot(x_z, self.kernel_z) + K.dot(h_tm1_z, self.recurrent_kernel_z)
-        r_t = K.dot(x_r, self.kernel_r) + K.dot(h_tm1_r, self.recurrent_kernel_r)
-        hh_t = K.dot(x_h, self.kernel_h)
+        z_t = K.dot(x_z, self.kernel[:, :self.units]) + K.dot(h_tm1_z, self.recurrent_kernel[:, :self.units])
+        r_t = K.dot(x_r, self.kernel[:, self.units: self.units * 2]) + K.dot(h_tm1_r, self.recurrent_kernel[:,self.units:self.units * 2])
+        hh_t = K.dot(x_h, self.kernel[:, self.units * 2:])
         if self.feed_masking:
-            z_t += K.dot(m_z, self.masking_kernel_z)
-            r_t += K.dot(m_r, self.masking_kernel_r)
-            hh_t += K.dot(m_h, self.masking_kernel_h)
+            z_t += K.dot(m_z, self.masking_kernel[:, :self.units])
+            r_t += K.dot(m_r, self.masking_kernel[:, self.units:self.units * 2])
+            hh_t += K.dot(m_h, self.masking_kernel[:, self.units * 2:])
         if self.use_bias:
-            z_t = K.bias_add(z_t, self.input_bias_z)
-            r_t = K.bias_add(r_t, self.input_bias_r)
-            hh_t = K.bias_add(hh_t, self.input_bias_h)
+            z_t = K.bias_add(z_t, input_bias[: self.units])
+            r_t = K.bias_add(r_t, input_bias[self.units : self.units * 2])
+            hh_t = K.bias_add(hh_t, input_bias[self.units * 2 :])
         z_t = self.recurrent_activation(z_t)
         r_t = self.recurrent_activation(r_t)
         
@@ -293,7 +350,7 @@ class GRUDCell(GRUCell):
             h_tm1_h = r_t * h_tm1d * rec_dp_mask[2]
         else:
             h_tm1_h = r_t * h_tm1d        
-        hh_t = self.activation(hh_t + K.dot(h_tm1_h, self.recurrent_kernel_h))
+        hh_t = self.activation(hh_t + K.dot(h_tm1_h, self.recurrent_kernel[:, self.units * 2:]))
 
         # get h_t
         h_t = z_t * h_tm1 + (1 - z_t) * hh_t
@@ -306,6 +363,24 @@ class GRUDCell(GRUCell):
                             K.tile(input_s, [1, self.state_size[-1]]),
                             s_prev_tm1)
         return h_t, [h_t, x_keep_t, s_prev_t]
+
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        if inputs is not None:
+            batch_size = K.shape(inputs[0])[0]
+            dtype = inputs[0].dtype
+    # def get_initial_state(self, inputs):
+        # initial_state = K.zeros_like(inputs[0])  # (samples, input_dim)
+        # initial_state = K.sum(initial_state, axis=(1,))  # (samples,)
+        # initial_state = K.expand_dims(initial_state)  # (samples, 1)
+        initial_state = K.zeros((batch_size, 1), dtype=dtype)
+        # ret = [K.tile(initial_state, [1, dim]) for dim in self.state_size[:-1]]
+        ret = [K.tile(initial_state, [1, dim]) for dim in self.state_size]
+        # initial_state for s_prev_tm1 should be the same as the first s
+        # depending on the direction.
+
+        # otherwise we take the first s.
+        # return ret + [K.tile(inputs[2][:, :], [1, self.state_size[-1]])]
+        return ret
 
     def get_config(self):
         # Remember to record all args of the `__init__`

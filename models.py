@@ -2,15 +2,15 @@ from __future__ import absolute_import, division, print_function
 
 from keras import backend as K
 from keras.layers import Activation, Dense, Dropout, Input, Masking
-from keras.layers.normalization import BatchNormalization
-from keras.layers.recurrent import GRU
-from keras.layers.wrappers import Bidirectional
+from keras.layers import BatchNormalization
+from keras.layers.rnn import GRU
+from keras.layers import Bidirectional
 from keras.models import load_model, Model
 from keras.regularizers import l2
-from keras.utils.generic_utils import custom_object_scope
+from keras.saving.object_registration import custom_object_scope
 
-from nn_utils.grud_layers import Bidirectional_for_GRUD, GRUD
-from nn_utils.layers import ExternalMasking
+from .nn_utils.grud_layers import Bidirectional_for_GRUD, GRUD
+from .nn_utils.layers import ExternalMasking
 
 
 __all__ = ['create_grud_model', 'load_grud_model']
