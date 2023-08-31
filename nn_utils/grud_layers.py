@@ -1,23 +1,30 @@
 from __future__ import absolute_import, division, print_function
 
-import tensorflow
-from keras import backend as K
-from keras import constraints, initializers, regularizers
+import tensorflow.compat.v2 as tf
+
+from keras import backend
+from keras import activations, constraints, initializers, regularizers
+from keras.engine import base_layer
+from keras.engine.input_spec import InputSpec
 from keras.layers import InputSpec, Layer
-import keras.layers.rnn.dropout_rnn_cell_mixin
-from keras.layers.rnn import rnn_utils
-from keras.layers.rnn import GRU, GRUCell, RNN
 from keras.layers import Bidirectional
+from keras.layers.rnn import gru_lstm_utils
+from keras.layers.rnn import rnn_utils
+from keras.layers.rnn.base_rnn import RNN
+
 from keras.utils.generic_utils import has_arg
 from keras.saving.serialization_lib import serialize_keras_object
 
-from .activations import get_activation
+from keras.layers.rnn.dropout_rnn_cell_mixin import DropoutRNNCellMixin
+from .maksing_dropout_rnn_cell_mixin import MaskingDropoutRNNCellMixin
 
-# def _generate_dropout_mask(ones, rate, training=None, count=1):
-#     return keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(K, ones=ones, rate=rate, training=training, count=count)
+# from .activations import get_activation
 
 __all__ = ['Bidirectional_for_GRUD', 'GRUDCell', 'GRUD']
 
+get_custom_objects().update({'exp_relu': Activation(lambda x: backend.exp(-backend.relu(x)))})
+
+@keras_export("keras.layers.GRUDCell", v1=[])
 class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseRandomLayer):
     """Cell class for the GRU-D layer. An extension of `GRUCell`.
     Notice: Calling with only 1 tensor due to the limitation of Keras.
@@ -78,13 +85,11 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                 "Received an invalid value for argument `implementation`, "
                 f"GRU-D only supports implementation=1, got {kwargs['implementation']}."
             )
-
         if not x_imputation in _SUPPORTED_IMPUTATION:
             raise ValueError(
                 "Received an invalid value for argument `x_imputation`, "
                 f"expected one of {_SUPPORTED_IMPUTATION}, got {kwargs['implementation']}."
-            )
-        
+            ) 
         if not feed_masking and (masking_decay is not None or masking_decay != 'None'):
             raise ValueError(
                 "Received an invalid value for argument `feed_masking`, "
@@ -130,14 +135,14 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
         # GRUDCell
         self.x_imputation = x_imputation
 
-        self.input_decay = get_activation(input_decay)
-        self.hidden_decay = get_activation(hidden_decay)
+        self.input_decay = activations.get(input_decay)
+        self.hidden_decay = activations.get(hidden_decay)
 
         self.use_decay_bias = use_decay_bias
 
         self.feed_masking = feed_masking
         if self.feed_masking:
-            self.masking_decay = get_activation(masking_decay)
+            self.masking_decay = activations.get(masking_decay)
         else:
             self.masking_decay = None
         
@@ -148,38 +153,74 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
             self.decay_regularizer = regularizers.get(decay_regularizer)
             self.decay_constraint = constraints.get(decay_constraint)
     
-    def build(self, input_shape):
-        """
-        Args:
-            input_shape: A tuple of 3 shapes (from x, m, s, respectively)
-        """
-        # Validate the shape of the input first. Borrow the idea from `_Merge`.
+    @tf_utils.shape_type_conversion
+    def build(
+        self,
+        input_shape
+    ):
         if not isinstance(input_shape, list) or len(input_shape) != 3:
-            raise ValueError('GRU-D be called on a list of 3 inputs (x, m, s).')
+            raise ValueError(
+                "Received an invalid value for argument `input_shape`, "
+                f"expected a list of 3 inputs (x, m, s), got {input_shape}."
+            )
+        
         if input_shape[0] != input_shape[1]:
-            raise ValueError('The input x and the masking m should have '
-                             'the same input shape, but got '
-                             '{} and {}.'.format(input_shape[0], input_shape[1]))
+            raise ValueError(
+                "The input x and the masking m should have "
+                "the same input shape, but got "
+                f"{input_shape[0]} and {input_shape[1]}.")
+        
         if input_shape[0][0] != input_shape[2][0]:
-            raise ValueError('The input x and the timestamp s should have '
-                             'the same batch size, but got '
-                             '{} and {}'.format(input_shape[0], input_shape[2]))
+            raise ValueError(
+                "The input x and the timestamp s should have "
+                "the same batch size, but got "
+                f"{input_shape[0]} and {input_shape[2]}.")
 
-        # Borrow the logic from GRUCell for the same part.
-        super(GRUDCell, self).build(input_shape[0])
+        super().build(input_shape)
 
-        # Modify the different parts from GRU.
         input_dim = input_shape[0][-1]
+        self.true_input_dim = input_dim
         self.state_size = (self.units, input_dim, input_dim)
+        default_caching_device = rnn_utils.caching_device(self)
 
-        # Build the own part of GRU-D.
+        # GRUCell
+        self.kernel = self.add_weight(
+            shape=(input_dim, self.units * 3),
+            name="kernel",
+            initializer=self.kernel_initializer,
+            regularizer=self.kernel_regularizer,
+            constraint=self.kernel_constraint,
+            caching_device=default_caching_device,
+        )
+        self.recurrent_kernel = self.add_weight(
+            shape=(self.units, self.units * 3),
+            name="recurrent_kernel",
+            initializer=self.recurrent_initializer,
+            regularizer=self.recurrent_regularizer,
+            constraint=self.recurrent_constraint,
+            caching_device=default_caching_device,
+        )
+        if self.use_bias:
+            self.bias = self.add_weight(
+                shape=(self.units * 3,),
+                name="bias",
+                initializer=self.bias_initializer,
+                regularizer=self.bias_regularizer,
+                constraint=self.bias_constraint,
+                caching_device=default_caching_device,
+            )
+        else:
+            self.bias = None
+
+        # GRUDCell
         if self.input_decay is not None:
             self.input_decay_kernel = self.add_weight(
                 shape=(input_dim,),
                 name='input_decay_kernel',
                 initializer=self.decay_initializer,
                 regularizer=self.decay_regularizer,
-                constraint=self.decay_constraint
+                constraint=self.decay_constraint,
+                caching_device=default_caching_device,
             )
             if self.use_decay_bias:
                 self.input_decay_bias = self.add_weight(
@@ -187,7 +228,8 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                     name='input_decay_bias',
                     initializer=self.bias_initializer,
                     regularizer=self.bias_regularizer,
-                    constraint=self.bias_constraint
+                    constraint=self.bias_constraint,
+                    caching_device=default_caching_device,
                 )
         if self.hidden_decay is not None:
             self.hidden_decay_kernel = self.add_weight(
@@ -195,7 +237,8 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                 name='hidden_decay_kernel',
                 initializer=self.decay_initializer,
                 regularizer=self.decay_regularizer,
-                constraint=self.decay_constraint
+                constraint=self.decay_constraint,
+                caching_device=default_caching_device,
             )
             if self.use_decay_bias:
                 self.hidden_decay_bias = self.add_weight(
@@ -203,7 +246,8 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                     name='hidden_decay_bias',
                     initializer=self.bias_initializer,
                     regularizer=self.bias_regularizer,
-                    constraint=self.bias_constraint
+                    constraint=self.bias_constraint,
+                    caching_device=default_caching_device,
                 )
         if self.feed_masking:
             self.masking_kernel = self.add_weight(
@@ -211,7 +255,8 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                 name='masking_kernel',
                 initializer=self.kernel_initializer,
                 regularizer=self.kernel_regularizer,
-                constraint=self.kernel_constraint
+                constraint=self.kernel_constraint,
+                caching_device=default_caching_device,
             )
             if self.masking_decay is not None:
                 self.masking_decay_kernel = self.add_weight(
@@ -219,7 +264,8 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                     name='masking_decay_kernel',
                     initializer=self.decay_initializer,
                     regularizer=self.decay_regularizer,
-                    constraint=self.decay_constraint
+                    constraint=self.decay_constraint,
+                    caching_device=default_caching_device,
                 )
                 if self.use_decay_bias:
                     self.masking_decay_bias = self.add_weight(
@@ -227,16 +273,14 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                         name='masking_decay_bias',
                         initializer=self.bias_initializer,
                         regularizer=self.bias_regularizer,
-                        constraint=self.bias_constraint
+                        constraint=self.bias_constraint,
+                        caching_device=default_caching_device,
                     )
 
-        self.true_input_dim = input_dim
         self.built = True
 
-    def call(self, inputs, states=None, training=None):
-        """We need to reimplmenet `call` entirely rather than reusing that
-        from `GRUCell` since there are lots of differences.
-
+    def call(self, inputs, states, training=None):
+        """
         Args:
             inputs: One tensor which is stacked by 3 inputs (x, m, s)
                 x and m are of shape (n_batch * input_dim).
@@ -245,104 +289,63 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                 (h_tm1, x_keep_tm1, s_prev_tm1)
         """
         # Get inputs and states
-        # input_x = inputs[:, :self.true_input_dim]   # inputs x, m, s
+        # input_x = inputs[:, :self.true_input_dim]
         # input_m = inputs[:, self.true_input_dim:-1]
         # input_s = inputs[:, -1:]
-        input_x = inputs[0]
-        input_m = inputs[1]
-        input_s = inputs[2]
-        if states is None:
-            # states = self.get_initial_state([input_x, input_m, input_s])
-            states = self.get_initial_state(inputs)
-        # Need to add broadcast for time_stamp if using theano backend.
-        if K.backend() == 'theano':
-            input_s = K.pattern_broadcast(input_s, [False, True])
+        input_x, input_m, input_s = inputs        
         h_tm1, x_keep_tm1, s_prev_tm1 = states
         # previous memory ([n_batch * self.units])
         # previous input x ([n_batch * input_dim])
         # and the subtraction term (of delta_t^d in Equation (2))
         # ([n_batch * input_dim])
-        input_1m = K.cast_to_floatx(1.) - input_m
+        input_1m = backend.cast_to_floatx(1.) - input_m
         input_d = input_s - s_prev_tm1
-
-        # Get dropout
-        if 0. < self.dropout < 1. and self._dropout_mask is None:
-            self._dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
-                self._random_generator,
-                K.ones_like(input_x),
-                self.dropout,
-                training=training,
-                count=3)
-            dp_mask = self._dropout_mask
-        if (0. < self.recurrent_dropout < 1. and
-                self._recurrent_dropout_mask is None):
-            self._recurrent_dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
-                self._random_generator,
-                K.ones_like(h_tm1),
-                self.recurrent_dropout,
-                training=training,
-                count=3)
-            rec_dp_mask = self._recurrent_dropout_mask
-
+        
+        dp_mask = self.get_dropout_mask_for_cell(input_x, training, count=3)
+        rec_dp_mask = self.get_recurrent_dropout_mask_for_cell(
+            h_tm1, training, count=3
+        )
         if self.feed_masking:
-            if 0. < self.dropout < 1. and self._masking_dropout_mask is None:
-                self._masking_dropout_mask = keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
-                    self._random_generator,
-                    K.ones_like(input_m),
-                    self.dropout,
-                    training=training,
-                    count=3)
-            m_dp_mask = self._masking_dropout_mask
-        
-        if self.use_bias:
-            if not self.reset_after:
-                input_bias, recurrent_bias = self.bias, None
-            else:
-                input_bias, recurrent_bias = tensorflow.unstack(self.bias)
-        
-        # dp_mask = self.get_dropout_mask_for_cell(input_x, training, count=3)
-        # rec_dp_mask = self.get_recurrent_dropout_mask_for_cell(
-        #     h_tm1, training, count=3
-        # )
-        # m_dp_mask = self.get_masking_dropout_mask_for_cell(
-        #     input_m, training, count=3
-        # )
+            m_dp_mask = self.get_masking_dropout_mask_for_cell(
+                input_m, training, count=3
+            )
 
         # Compute decay if any
         if self.input_decay is not None:
             gamma_di = input_d * self.input_decay_kernel
             if self.use_decay_bias:
-                gamma_di = K.bias_add(gamma_di, self.input_decay_bias)
+                gamma_di = backend.bias_add(gamma_di, self.input_decay_bias)
             gamma_di = self.input_decay(gamma_di)
         if self.hidden_decay is not None:
-            gamma_dh = K.dot(input_d, self.hidden_decay_kernel)
+            gamma_dh = backend.dot(input_d, self.hidden_decay_kernel)
             if self.use_decay_bias:
-                gamma_dh = K.bias_add(gamma_dh, self.hidden_decay_bias)
+                gamma_dh = backend.bias_add(gamma_dh, self.hidden_decay_bias)
             gamma_dh = self.hidden_decay(gamma_dh)
         if self.feed_masking and self.masking_decay is not None:
             gamma_dm = input_d * self.masking_decay_kernel
             if self.use_decay_bias:
-                gamma_dm = K.bias_add(gamma_dm, self.masking_decay_bias)
+                gamma_dm = backend.bias_add(gamma_dm, self.masking_decay_bias)
             gamma_dm = self.masking_decay(gamma_dm)
 
         # Get the imputed or decayed input if needed
         # and `x_keep_t` for the next time step
 
         if self.input_decay is not None:
-            x_keep_t = K.switch(input_m, input_x, x_keep_tm1)
-            x_t = K.switch(input_m, input_x, gamma_di * x_keep_t)
+            x_keep_t = backend.switch(input_m, input_x, x_keep_tm1)
+            x_t = backend.switch(input_m, input_x, gamma_di * x_keep_t)
         elif self.x_imputation == 'forward':
-            x_t = K.switch(input_m, input_x, x_keep_tm1)
+            x_t = backend.switch(input_m, input_x, x_keep_tm1)
             x_keep_t = x_t
         elif self.x_imputation == 'zero':
-            x_t = K.switch(input_m, input_x, K.zeros_like(input_x))
+            x_t = backend.switch(input_m, input_x, backend.zeros_like(input_x))
             x_keep_t = x_t
         elif self.x_imputation == 'raw':
             x_t = input_x
             x_keep_t = x_t
         else:
-            raise ValueError('No input decay or invalid x_imputation '
-                             '{}.'.format(self.x_imputation))
+            raise ValueError(
+                "No input decay or invalid x_imputation "
+                f"{self.x_imputation}.")
 
         # Get decayed hidden if needed
         if self.hidden_decay is not None:
@@ -376,17 +379,17 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
             h_tm1_z, h_tm1_r = h_tm1d, h_tm1d
 
         # Get z_t, r_t, hh_t
-        z_t = K.dot(x_z, self.kernel[:, :self.units]) + K.dot(h_tm1_z, self.recurrent_kernel[:, :self.units])
-        r_t = K.dot(x_r, self.kernel[:, self.units: self.units * 2]) + K.dot(h_tm1_r, self.recurrent_kernel[:,self.units:self.units * 2])
-        hh_t = K.dot(x_h, self.kernel[:, self.units * 2:])
+        z_t = backend.dot(x_z, self.kernel[:, :self.units]) + backend.dot(h_tm1_z, self.recurrent_kernel[:, :self.units])
+        r_t = backend.dot(x_r, self.kernel[:, self.units: self.units * 2]) + backend.dot(h_tm1_r, self.recurrent_kernel[:,self.units:self.units * 2])
+        hh_t = backend.dot(x_h, self.kernel[:, self.units * 2:])
         if self.feed_masking:
-            z_t += K.dot(m_z, self.masking_kernel[:, :self.units])
-            r_t += K.dot(m_r, self.masking_kernel[:, self.units:self.units * 2])
-            hh_t += K.dot(m_h, self.masking_kernel[:, self.units * 2:])
+            z_t += backend.dot(m_z, self.masking_kernel[:, :self.units])
+            r_t += backend.dot(m_r, self.masking_kernel[:, self.units:self.units * 2])
+            hh_t += backend.dot(m_h, self.masking_kernel[:, self.units * 2:])
         if self.use_bias:
-            z_t = K.bias_add(z_t, input_bias[: self.units])
-            r_t = K.bias_add(r_t, input_bias[self.units : self.units * 2])
-            hh_t = K.bias_add(hh_t, input_bias[self.units * 2 :])
+            z_t = backend.bias_add(z_t, self.bias[: self.units])
+            r_t = backend.bias_add(r_t, self.bias[self.units : self.units * 2])
+            hh_t = backend.bias_add(hh_t, self.bias[self.units * 2 :])
         z_t = self.recurrent_activation(z_t)
         r_t = self.recurrent_activation(r_t)
         
@@ -394,7 +397,7 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
             h_tm1_h = r_t * h_tm1d * rec_dp_mask[2]
         else:
             h_tm1_h = r_t * h_tm1d        
-        hh_t = self.activation(hh_t + K.dot(h_tm1_h, self.recurrent_kernel[:, self.units * 2:]))
+        hh_t = self.activation(hh_t + backend.dot(h_tm1_h, self.recurrent_kernel[:, self.units * 2:]))
 
         # get h_t
         h_t = z_t * h_tm1 + (1 - z_t) * hh_t
@@ -403,29 +406,12 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                 h_t._uses_learning_phase = True
 
         # get s_prev_t
-        s_prev_t = K.switch(input_m, 
-                            K.tile(input_s, [1, self.state_size[-1]]),
+        s_prev_t = backend.switch(input_m, 
+                            backend.tile(input_s, [1, self.state_size[-1]]),
                             s_prev_tm1)
         return h_t, [h_t, x_keep_t, s_prev_t]
 
-    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
-        if inputs is not None:
-            batch_size = K.shape(inputs[0])[0]
-            dtype = inputs[0].dtype
-    # def get_initial_state(self, inputs):
-        # initial_state = K.zeros_like(inputs[0])  # (samples, input_dim)
-        # initial_state = K.sum(initial_state, axis=(1,))  # (samples,)
-        # initial_state = K.expand_dims(initial_state)  # (samples, 1)
-        initial_state = K.zeros((batch_size, 1), dtype=dtype)
-        # ret = [K.tile(initial_state, [1, dim]) for dim in self.state_size[:-1]]
-        ret = [K.tile(initial_state, [1, dim]) for dim in self.state_size]
-        # initial_state for s_prev_tm1 should be the same as the first s
-        # depending on the direction.
-
-        # otherwise we take the first s.
-        # return ret + [K.tile(inputs[2][:, :], [1, self.state_size[-1]])]
-        return ret
-
+    # TODO: continue here
     def get_config(self):
         # Remember to record all args of the `__init__`
         # which are not covered by `GRUCell`.
@@ -441,6 +427,29 @@ class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseR
                  }
         base_config = super(GRUDCell, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
+
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        return rnn_utils.generate_zero_filled_state_for_cell(
+            self, inputs, batch_size, dtype
+        )
+
+    # def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+    #     if inputs is not None:
+    #         batch_size = backend.shape(inputs[0])[0]
+    #         dtype = inputs[0].dtype
+    # # def get_initial_state(self, inputs):
+    #     # initial_state = backend.zeros_like(inputs[0])  # (samples, input_dim)
+    #     # initial_state = backend.sum(initial_state, axis=(1,))  # (samples,)
+    #     # initial_state = backend.expand_dims(initial_state)  # (samples, 1)
+    #     initial_state = backend.zeros((batch_size, 1), dtype=dtype)
+    #     # ret = [backend.tile(initial_state, [1, dim]) for dim in self.state_size[:-1]]
+    #     ret = [backend.tile(initial_state, [1, dim]) for dim in self.state_size]
+    #     # initial_state for s_prev_tm1 should be the same as the first s
+    #     # depending on the direction.
+
+    #     # otherwise we take the first s.
+    #     # return ret + [backend.tile(inputs[2][:, :], [1, self.state_size[-1]])]
+    #     return ret
 
 
 class GRUD(GRU):
@@ -565,19 +574,19 @@ class GRUD(GRU):
 
     def get_initial_state(self, inputs):
         # build an all-zero tensor of shape (samples, output_dim)
-        initial_state = K.zeros_like(inputs[0])  # (samples, timesteps, input_dim)
-        initial_state = K.sum(initial_state, axis=(1, 2))  # (samples,)
-        initial_state = K.expand_dims(initial_state)  # (samples, 1)
-        ret = [K.tile(initial_state, [1, dim]) for dim in self.cell.state_size[:-1]]
+        initial_state = backend.zeros_like(inputs[0])  # (samples, timesteps, input_dim)
+        initial_state = backend.sum(initial_state, axis=(1, 2))  # (samples,)
+        initial_state = backend.expand_dims(initial_state)  # (samples, 1)
+        ret = [backend.tile(initial_state, [1, dim]) for dim in self.cell.state_size[:-1]]
         # initial_state for s_prev_tm1 should be the same as the first s
         # depending on the direction.
         if self.go_backwards:
             # if go_backwards, we take the last s
             # (we take the largest one in case the padded input can be invalid)
-            return ret + [K.tile(K.max(inputs[2], axis=1),
+            return ret + [backend.tile(backend.max(inputs[2], axis=1),
                                  [1, self.cell.state_size[-1]])]
         # otherwise we take the first s.
-        return ret + [K.tile(inputs[2][:, 0, :], [1, self.cell.state_size[-1]])]
+        return ret + [backend.tile(inputs[2][:, 0, :], [1, self.cell.state_size[-1]])]
 
     def __call__(self, inputs, initial_state=None, **kwargs):
         # We skip `__call__` of `RNN` and `GRU` in this case and directly execute
@@ -595,13 +604,13 @@ class GRUD(GRU):
         additional_specs = []
         kwargs['initial_state'] = initial_state
         additional_inputs += initial_state
-        self.state_spec = [InputSpec(shape=K.int_shape(state))
+        self.state_spec = [InputSpec(shape=backend.int_shape(state))
                            for state in initial_state]
         additional_specs += self.state_spec
         # at this point additional_inputs cannot be empty
-        is_keras_tensor = K.is_keras_tensor(additional_inputs[0])
+        is_keras_tensor = backend.is_keras_tensor(additional_inputs[0])
         for tensor in additional_inputs:
-            if K.is_keras_tensor(tensor) != is_keras_tensor:
+            if backend.is_keras_tensor(tensor) != is_keras_tensor:
                 raise ValueError('The initial state or constants of an RNN'
                                  ' layer cannot be specified with a mix of'
                                  ' Keras tensors and non-Keras tensors'
@@ -640,7 +649,7 @@ class GRUD(GRU):
                              ' states but was passed ' +
                              str(len(initial_state)) +
                              ' initial states.')
-        timesteps = K.int_shape(inputs[0])[1]
+        timesteps = backend.int_shape(inputs[0])[1]
 
         kwargs = {}
         if has_arg(self.cell.call, 'training'):
@@ -650,9 +659,9 @@ class GRUD(GRU):
             return self.cell.call(inputs, states, **kwargs)
         # concatenate the inputs and get the mask
 
-        concatenated_inputs = K.concatenate(inputs, axis=-1)
+        concatenated_inputs = backend.concatenate(inputs, axis=-1)
         mask = mask[0]
-        last_output, outputs, states = K.rnn(step,
+        last_output, outputs, states = backend.rnn(step,
                                              concatenated_inputs,
                                              initial_state,
                                              go_backwards=self.go_backwards,
@@ -727,8 +736,8 @@ class GRUD(GRU):
                   'decay_initializer': initializers.get(self.decay_initializer),
                   'decay_regularizer': regularizers.get(self.decay_regularizer),
                   'decay_constraint': constraints.get(self.decay_constraint)}
-        base_config = super(GRUD, self).get_config()
-        for c in ['implementation', 'reset_after']:
+        base_config = super().get_config()
+        for c in ['implementation']:
             del base_config[c]
         return dict(list(base_config.items()) + list(config.items()))
 
@@ -759,7 +768,7 @@ class Bidirectional_for_GRUD(Bidirectional):
 
             kwargs['initial_state'] = initial_state
             additional_inputs += initial_state
-            state_specs = [InputSpec(shape=K.int_shape(state))
+            state_specs = [InputSpec(shape=backend.int_shape(state))
                            for state in initial_state]
             self.forward_layer.state_spec = state_specs[:num_states // 2]
             self.backward_layer.state_spec = state_specs[num_states // 2:]
@@ -767,7 +776,7 @@ class Bidirectional_for_GRUD(Bidirectional):
         if constants is not None:
             kwargs['constants'] = constants
             additional_inputs += constants
-            constants_spec = [InputSpec(shape=K.int_shape(constant))
+            constants_spec = [InputSpec(shape=backend.int_shape(constant))
                               for constant in constants]
             self.forward_layer.constants_spec = constants_spec
             self.backward_layer.constants_spec = constants_spec
@@ -777,9 +786,9 @@ class Bidirectional_for_GRUD(Bidirectional):
             self.forward_layer._num_constants = self._num_constants
             self.backward_layer._num_constants = self._num_constants
 
-        is_keras_tensor = K.is_keras_tensor(additional_inputs[0])
+        is_keras_tensor = backend.is_keras_tensor(additional_inputs[0])
         for tensor in additional_inputs:
-            if K.is_keras_tensor(tensor) != is_keras_tensor:
+            if backend.is_keras_tensor(tensor) != is_keras_tensor:
                 raise ValueError('The initial state of a Bidirectional'
                                  ' layer cannot be specified with a mix of'
                                  ' Keras tensors and non-Keras tensors'
