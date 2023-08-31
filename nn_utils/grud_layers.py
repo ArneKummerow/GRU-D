@@ -18,53 +18,126 @@ from .activations import get_activation
 
 __all__ = ['Bidirectional_for_GRUD', 'GRUDCell', 'GRUD']
 
-
-class GRUDCell(GRUCell):
+class GRUDCell(DropoutRNNCellMixin, MaskingDropoutRNNCellMixin, base_layer.BaseRandomLayer):
     """Cell class for the GRU-D layer. An extension of `GRUCell`.
     Notice: Calling with only 1 tensor due to the limitation of Keras.
     Building, computing the shape with the input_shape as a list of length 3.
     # TODO: dynamic imputation
     """
 
-    def __init__(self, units,
-                 x_imputation='zero',
-                 input_decay='exp_relu', hidden_decay='exp_relu', use_decay_bias=True,
-                 feed_masking=True, masking_decay=None,
-                 decay_initializer='zeros', decay_regularizer=None,
-                 decay_constraint=None,
-                 **kwargs):
-        super(GRUDCell, self).__init__(units, **kwargs)
-        # self._masking_dropout_mask_cache = K.ContextValueCache(
-        #     self._create_masking_dropout_mask
-        # )
+    def __init__(
+        self,
 
-        assert 'reset_after' not in kwargs or not kwargs['reset_after'], (
-            'Only the default GRU reset gate can be used in GRU-D.'
-        )
-        assert ('implementation' not in kwargs
-                or kwargs['implementation'] == 1), (
-                    'Only Implementation-1 (larger number of smaller operations) '
-                    'is supported in GRU-D.'
-                )
+        ### GRUCell ###
+        units,
 
-        assert x_imputation in _SUPPORTED_IMPUTATION, (
-            'x_imputation {} argument is not supported.'.format(x_imputation)
-        )
+        activation="tanh",
+        recurrent_activation="sigmoid",
+
+        use_bias=True,
+
+        kernel_initializer="glorot_uniform",
+        recurrent_initializer="orthogonal",
+        bias_initializer="zeros",
+
+        kernel_regularizer=None,
+        recurrent_regularizer=None,
+        bias_regularizer=None,
+
+        kernel_constraint=None,
+        recurrent_constraint=None,
+        bias_constraint=None,
+
+        dropout=0.0,
+        recurrent_dropout=0.0,
+
+        ### GRUDCell ###
+        x_imputation='zero',
+
+        input_decay='exp_relu',
+        hidden_decay='exp_relu',
+
+        use_decay_bias=True,
+
+        feed_masking=True,
+        masking_decay=None,
+
+        decay_initializer='zeros',
+        decay_regularizer=None,
+        decay_constraint=None,
+
+        **kwargs
+    ):
+        if units <= 0:
+            raise ValueError(
+                "Received an invalid value for argument `units`, "
+                f"expected a positive integer, got {units}."
+            )
+        if 'implementation' in kwargs and kwargs['implementation'] != 1:
+            raise ValueError(
+                "Received an invalid value for argument `implementation`, "
+                f"GRU-D only supports implementation=1, got {kwargs['implementation']}."
+            )
+
+        if not x_imputation in _SUPPORTED_IMPUTATION:
+            raise ValueError(
+                "Received an invalid value for argument `x_imputation`, "
+                f"expected one of {_SUPPORTED_IMPUTATION}, got {kwargs['implementation']}."
+            )
+        
+        if not feed_masking and (masking_decay is not None or masking_decay != 'None'):
+            raise ValueError(
+                "Received an invalid value for argument `feed_masking`, "
+                f"`masking_decay` is {masking_decay}, but `feed_masking` is {feed_masking}."
+            )
+            'Mask needs to be fed into GRU-D to enable the mask_decay.'
+
+        # By default use cached variable under v2 mode, see b/143699808.
+        if tf.compat.v1.executing_eagerly_outside_functions():
+            self._enable_caching_device = kwargs.pop(
+                "enable_caching_device", True
+            )
+        else:
+            self._enable_caching_device = kwargs.pop(
+                "enable_caching_device", False
+            )
+        
+        super().__init__(units, **kwargs)
+
+        self.units = units
+        self.activation = activations.get(activation)
+        self.recurrent_activation = activations.get(recurrent_activation)
+        self.use_bias = use_bias
+
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.recurrent_initializer = initializers.get(recurrent_initializer)
+        self.bias_initializer = initializers.get(bias_initializer)
+
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.recurrent_regularizer = regularizers.get(recurrent_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
+
+        self.kernel_constraint = constraints.get(kernel_constraint)
+        self.recurrent_constraint = constraints.get(recurrent_constraint)
+        self.bias_constraint = constraints.get(bias_constraint)
+
+        self.dropout = min(1.0, max(0.0, dropout))
+        self.recurrent_dropout = min(1.0, max(0.0, recurrent_dropout))
+        
+        self.state_size = None
+        self.output_size = self.units
+
+        # GRUDCell
         self.x_imputation = x_imputation
 
         self.input_decay = get_activation(input_decay)
         self.hidden_decay = get_activation(hidden_decay)
+
         self.use_decay_bias = use_decay_bias
 
-        assert (feed_masking or masking_decay is None
-                or masking_decay == 'None'), (
-                    'Mask needs to be fed into GRU-D to enable the mask_decay.'
-                )
         self.feed_masking = feed_masking
         if self.feed_masking:
             self.masking_decay = get_activation(masking_decay)
-            # self._masking_dropout_mask = None
-            self._masking_dropout_mask = None
         else:
             self.masking_decay = None
         
@@ -74,36 +147,7 @@ class GRUDCell(GRUCell):
             self.decay_initializer = initializers.get(decay_initializer)
             self.decay_regularizer = regularizers.get(decay_regularizer)
             self.decay_constraint = constraints.get(decay_constraint)
-        
-    # def reset_masking_dropout_mask(self):
-    #     self._masking_dropout_mask_cache.clear()
     
-    # def _create_masking_dropout_mask(self, inputs, training, count=1):
-    #     return keras.layers.rnn.dropout_rnn_cell_mixin._generate_dropout_mask(
-    #         self._random_generator,
-    #         tf.ones_like(inputs),
-    #         self.dropout,
-    #         training=training,
-    #         count=count,
-    #     )
-
-    # def get_masking_dropout_mask_for_cell(self, inputs, training, count=1):
-    #     if self.dropout == 0:
-    #         return None
-    #     init_kwargs = dict(inputs=inputs, training=training, count=count)
-    #     return self._masking_dropout_mask_cache.setdefault(kwargs=init_kwargs)
-
-    # def __getstate__(self):
-    #     state = super().__getstate__()
-    #     state.pop("_masking_dropout_mask_cache", None)
-    #     return state
-
-    # def __setstate__(self, state):
-    #     state["_masking_dropout_mask_cache"] = backend.ContextValueCache(
-    #         self._create_dropout_mask
-    #     )
-    #     super().__setstate__(state)
-
     def build(self, input_shape):
         """
         Args:
@@ -783,7 +827,6 @@ def _standardize_grud_args(inputs, initial_state):
     
     initial_state = to_list_or_none(initial_state)
     return inputs, initial_state
-
 
 _SUPPORTED_IMPUTATION = ['zero', 'forward', 'raw']
 
