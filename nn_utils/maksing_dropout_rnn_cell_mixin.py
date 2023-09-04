@@ -32,7 +32,7 @@ class MaskingDropoutRNNCellMixin:
         )
 
     def get_masking_dropout_mask_for_cell(self, inputs, training, count=1):
-        if self.masking_dropout == 0:
+        if self.dropout == 0.0:
             return None
         init_kwargs = dict(inputs=inputs, training=training, count=count)
         return self._masking_dropout_mask_cache.setdefault(kwargs=init_kwargs)
